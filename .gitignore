@@ -1,0 +1,6 @@
+monitor_state.json
+job_monitor.log
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
