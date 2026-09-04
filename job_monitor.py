@@ -58,6 +58,19 @@ CHECK_INTERVAL = 1
 # How often the display rotates one row (in seconds) — independent of CHECK_INTERVAL
 DISPLAY_INTERVAL = 0.15
 
+# How often the display rotates while SPACE is held down (fast-forward)
+DISPLAY_INTERVAL_FAST = 0.01
+
+# How long to wait after a tap for the OS's key-repeat to confirm it was actually a hold.
+# Needs to comfortably exceed the OS's "delay until repeat" (commonly ~400-700ms) — too short
+# and a genuine hold gets treated as tap+release+tap+..., which leaves the pause toggle
+# flipped an odd number of times (net effect: holding SPACE just pauses).
+SPACE_TAP_CONFIRM_TIMEOUT = 0.85
+
+# Once repeating (held), a gap this large between SPACE chars means the key was released.
+# Repeat characters arrive much faster than this once key-repeat kicks in.
+SPACE_HELD_RELEASE_TIMEOUT = 0.2
+
 # File to persist state between restarts
 STATE_FILE = "monitor_state.json"
 
@@ -107,7 +120,7 @@ BACHELOR_DEGREES = {"bachelor's", "b.a", "b.a.", "b.s", "b.s.", "bachelor"}
 EXCLUDED_ROLE_KEYWORDS: frozenset[str] = frozenset({
     "data analytics", "data science", "data scientist",
     "data analyst", "data science analyst", "data engineering",
-    "data intern", "data management", "innovation technology"
+    "data intern", "data management", "innovation technology", "data nerd", "data analyzer"
 })
 
 # Full-time (New Grad) positions must be in one of these locations to qualify.
@@ -188,7 +201,10 @@ _listings_cache: dict[str, list[dict]] = {}
 # (norm_company, norm_title) pairs locked in any README; updated by check_for_updates
 _readme_locked_keys: set[tuple[str, str]] = set()
 _display_offset: int  = 0     # rotates the visible window each cycle
-_display_paused: bool = False  # toggled by SPACE keypress
+_display_paused: bool = False   # toggled by a SPACE tap
+_display_speedup: bool = False  # True while SPACE is held down — speeds up the ticker
+_space_state: str = "idle"      # "idle" | "pending" (tap, awaiting a possible repeat) | "held"
+_space_last_time: float = 0.0   # time.time() of the last SPACE char received
 DISPLAY_WINDOW  : int = 60    # how many rows are visible at once
 DISPLAY_POOL    : int = 60    # total entries fetched to rotate through
 
@@ -309,7 +325,7 @@ def role_marker(title: str, category: str = "") -> str:
     if is_rb: parts.append("RB")
     if is_ai: parts.append("AI")
     if is_fd: parts.append("FD")
-    return "+".join(parts) if parts else "?"
+    return "+".join(parts) if parts else raw   
 
 
 def is_qualifying_listing(listing: dict, source_name: str = "") -> bool:
@@ -824,6 +840,7 @@ def _build_entries() -> list[dict]:
                 "work_type":    format_work_type(listing, name),
                 "location":     display_loc,
                 "marker":       role_marker(listing.get("title", ""), listing.get("category", "")),
+                "url":          listing.get("url", ""),
                 "_date_posted": listing.get("date_posted", 0),
             })
     entries.sort(key=lambda e: e["_date_posted"], reverse=True)
@@ -847,6 +864,7 @@ def print_latest_jobs():
         _display_offset = (_display_offset + 1) % n
 
     rank_w = len(str(DISPLAY_POOL))
+    cols   = shutil.get_terminal_size().columns
     RESET  = "\033[0m"
     GREY   = "\033[90m"
     print("\033[H\033[2J", end="", flush=True)
@@ -867,7 +885,12 @@ def print_latest_jobs():
         marker    = e.get("marker", "?")[:8].ljust(8)
         age       = format_age(e["_date_posted"])
         rank      = str(e["rank"]).rjust(rank_w)
-        print(f"{color}  {company}  {work_type}  {location}  {marker}  {age}  {rank}{RESET}")
+        link      = e.get("url") or "Link unavailable"
+
+        prefix_visible = f"  {company}  {work_type}  {location}  {marker}  {age}  {rank}  "
+        max_link_len   = max(10, cols - len(prefix_visible) - 1)
+        link           = link[:max_link_len]
+        print(f"{color}{prefix_visible}{link}{RESET}")
 
     if _display_paused:
         print(f"\n{GREY}  ⏸  PAUSED — press SPACE to resume{RESET}", flush=True)
@@ -945,12 +968,15 @@ def _display_thread_fn():
     """Rotate the terminal display independently of the network check cycle."""
     while True:
         print_latest_jobs()
-        time.sleep(DISPLAY_INTERVAL)
+        time.sleep(DISPLAY_INTERVAL_FAST if _display_speedup else DISPLAY_INTERVAL)
 
 
 def _keyboard_listener_fn():
-    """Listen for SPACE keypresses to toggle display pause. Runs in a daemon thread."""
-    global _display_paused
+    """Listen for SPACE keypresses. A quick tap toggles pause; holding the key down
+    (detected via the terminal's OS-level key-repeat) speeds up the ticker instead —
+    the tap's pause toggle is reverted once a repeat confirms it's a hold, so pause
+    state is left untouched by holding. Runs in a daemon thread."""
+    global _display_paused, _display_speedup, _space_state, _space_last_time
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
@@ -959,7 +985,22 @@ def _keyboard_listener_fn():
             if select.select([sys.stdin], [], [], 0.1)[0]:
                 ch = sys.stdin.read(1)
                 if ch == " ":
-                    _display_paused = not _display_paused
+                    _space_last_time = time.time()
+                    if _space_state == "idle":
+                        _display_paused = not _display_paused   # tap
+                        _space_state = "pending"
+                    elif _space_state == "pending":
+                        _display_paused = not _display_paused   # repeat arrived — revert, it's a hold
+                        _space_state = "held"
+                        _display_speedup = True
+                    # already "held": just keep going, _space_last_time already refreshed above
+
+            now = time.time()
+            if _space_state == "pending" and (now - _space_last_time) > SPACE_TAP_CONFIRM_TIMEOUT:
+                _space_state = "idle"   # no repeat ever came — it really was just a tap
+            elif _space_state == "held" and (now - _space_last_time) > SPACE_HELD_RELEASE_TIMEOUT:
+                _space_state = "idle"
+                _display_speedup = False
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
